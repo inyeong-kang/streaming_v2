@@ -1,15 +1,14 @@
 import math
 import argparse
+import asyncio
 import json
 import logging
-from logging import raiseExceptions
 import os
 import ssl
 import uuid
 
 import cv2
 from aiohttp import web
-import aiohttp_cors
 from av import VideoFrame
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
@@ -20,74 +19,144 @@ import timeit
 import asyncio
 import numpy as np
 import mediapipe as mp
-from reid.torchreid.utils import FeatureExtractor
-
-from face_detection import face_detection
-from dtos import DetectionRegions
-from dtos import FaceRegions
-from dtos import FMOT_TrackingRegions
 from face_detection import face_detection
 from object_det_v2 import object_detection
 from detection_processing import detection_processing
-from FastMOT.fastmot.tracker import MultiTracker
-from FastMOT.fastmot.utils import ConfigDecoder
-import json
-from types import SimpleNamespace
-from utils import *
 
-DET_DTYPE = np.dtype(
-    [('tlbr', float, 4),
-     ('label', int),
-     ('conf', float)],
-    align=True
-)
+def get_ratio(image_width, image_height):
+  return image_width / image_height
 
-def regions_to_detections(all_regions):
-    boxes = []
-    d = DetectionRegions(0,0,0,0,0,-1)
-    f = FaceRegions(0,0,0,0,'tmp',0)
-    t = FMOT_TrackingRegions(0,0,0,0,-1)
-    for i, region in enumerate(all_regions):
-        y1 = int(region.y * image_height)
-        x1 = int(region.x * image_width)
-        y2 = int((region.y + region.h) * image_height)
-        x2 = int((region.x + region.w) * image_width)
-        
-        if (type(region) == type(f)):
-            class_id = 1
-        elif (type(region)== type(d)):
-            class_id = int(region.class_id)
-        else:
-            raiseExceptions("data type을 확인할 수 없습니다.")
-        score = region.score
-        # boxes.append(([top, left, bottom, right], class_id, score))
-        boxes.append(([x1, y1, x2, y2], class_id, score))
+def round_to_even(value):
+  rounded_value = round(value)
 
-    return np.array(boxes, DET_DTYPE).view(np.recarray)
+  if (rounded_value % 2 == 1):
+    rounded_value = max(2, rounded_value - 1)
+  
+  return rounded_value
 
-def detect_objects(image):
-  # face detection
-  fd = face_detection(image)
-  fd.detect_faces()
-  regions = fd.localization_to_region()
-  #visualize_faces(image, regions, image_width, image_height)
+def visualize_faces(image, regions, image_width, image_height):
+  """
+  face detection visualization
+  ----------
+  Parameters
+    image : Array of uint8
+    regions : list
+      0 : face full region. Shape (N)
+      1 : face core landmarks. Shape (N, 4)
+      2 : face all landmarks. Shape (N, 6)
+    image_width : int
+    image_height : int
+  -------
+  Returns
+    NONE
+  """
+  if regions[0] != []:
+      for i in range(len(regions[0])):
+        face_full_region = [regions[0][i].x, regions[0][i].y, regions[0][i].w, regions[0][i].h]
 
-  # object detection
-  od = object_detection(image)
-  output_dict, category_index = od.detect_objects()
-  boxes = output_dict['detection_boxes']
-  classes = output_dict['detection_classes']
-  scores = output_dict['detection_scores']
-  #visualize_objects(image, boxes, classes, scores, category_index, image_width, image_height)     
+        x_px = min(math.floor(face_full_region[0] * image_width), image_width - 1)
+        y_px = min(math.floor(face_full_region[1] * image_height), image_height - 1)
+        w_px = min(math.floor(face_full_region[2] * image_width), image_width - 1)
+        h_px = min(math.floor(face_full_region[3] * image_height), image_height - 1)
+        cv2.rectangle(image, (x_px, y_px), (x_px+w_px, y_px+h_px), (0,0,255), 3)
+
+        score = regions[0][i].score
+        score = round(score, 5)
+        cv2.putText(image,
+            "FACE: " + str(score),
+            (x_px, y_px + 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2,
+            (255, 255, 255),
+            2)
+
+      face_all_landmark = regions[2]
+      for i in range(len(face_all_landmark)):
+        all_landmark = face_all_landmark[i]
+        for j in range(6):
+
+          x_px = min(math.floor(all_landmark[j].x * image.shape[1]), image.shape[1] - 1)
+          y_px = min(math.floor(all_landmark[j].y * image.shape[0]), image.shape[0] - 1)
+          w_px = int(all_landmark[j].w * image.shape[1])
+          h_px = int(all_landmark[j].h * image.shape[0])
+
+          cv2.rectangle(image, (x_px, y_px), (x_px+w_px, y_px+h_px), (255,255,255), 3)
 
 
-  # detection processing
-  dp = detection_processing(boxes, classes, scores, regions[0])
-  dp.tensors_to_regions()
-  all_regions = dp.sort_detection()
+def visualize_objects(image, boxes, classes, scores, category_index, image_width, image_height):
+  """
+  object detection visualization
+  ----------
+  Parameters
+    image : Array of uint8
+    regions : list
+    boxes : list
+      local information of detected objects. Shape (N, 4) 
+    classes : list
+      classes of detected objects. Shape (N)
+    scores : list
+      scores of detected objects. Shape (N)
+    category_index : dict
+    image_width : int
+    image_height : int
+  -------
+  Returns
+    NONE
+  """
+  for i in range(len(classes)):
+    ymin, xmin, ymax, xmax = boxes[i]
+    (left, right, top, bottom) = (xmin * image_width, xmax * image_width, ymin * image_height, ymax * image_height)
+    left = int(left)
+    right = int(right)
+    top = int(top)
+    bottom = int(bottom)
 
-  return all_regions
+    cv2.rectangle(image, (left, top), (right, bottom), (255, 0, 0), 2)
 
+    cv2.putText(image,
+            str(category_index[classes[i]]['name']),
+            (left, top),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            3,
+            (0, 0, 255),
+            2)
+    cv2.putText(image,
+            str(scores[i]),
+            (left, top + 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            3,
+            (0, 0, 255),
+            2)
+
+def decide_target_size(original_ratio, requested_ratio, image_width, image_height):
+  if (original_ratio > requested_ratio):
+    target_height = round_to_even(image_height)
+    target_width = round_to_even(image_height * requested_ratio)
+    scaled_target_width = target_width / image_width
+
+    return target_width, target_height, scaled_target_width
+  
+  else:
+    target_width = round_to_even(image_width)
+    target_height = round_to_even(image_width / requested_ratio)
+    scaled_target_height = target_height / image_height
+
+    return target_width, target_height, scaled_target_height
+
+async def camera_sweeping(left, pre_x_center, optimal_x_center, image_width, target_width, image):
+  if (pre_x_center > optimal_x_center):
+    idx = -1
+  else:
+    idx = 1
+  sweep = left + pre_x_center - optimal_x_center
+  print("SWEEP", sweep, left, pre_x_center, optimal_x_center)
+  while (sweep != left):
+    sweep += idx
+    print("SWEPPING", sweep, pre_x_center, optimal_x_center)
+    if (sweep < 0 or sweep > image_width - target_width):
+      break
+    img = image[:, sweep:sweep+target_width]
+    cv2.imshow('cropped', img)
     
 # async def show_cropped_frame()
 
@@ -162,8 +231,6 @@ class VideoTransformTrack(VideoStreamTrack):
             return new_frame
  
         elif self.transform == "tracking":
-            
-            #global image_width, image_height 
             pre_x_center = -10000
             last_detection = 0
             #print("detection started!")
@@ -309,17 +376,15 @@ class VideoTransformTrack(VideoStreamTrack):
             return frame
 
 
-async def home(request):
-    return await javascript(request, 'HomeScreen.js')
-   
-async def track(request):
-    return await javascript(request, 'TrackScreen.js')
-  
-async def javascript(request, file):
-    content = open(os.path.join(ROOT,"src/components", file), "r").read()
-    return web.Response(content_type="application/javascript", text=content)
 
-'''
+async def index(request):
+    content = open(os.path.join(ROOT, "index.html"), "r").read()
+    return web.Response(content_type="text/html", text=content)
+
+async def preview(request):
+    content = open(os.path.join(ROOT, "preview.html"), "r").read()
+    return web.Response(content_type="text/html", text=content)
+
 async def javascriptn(request):
     content = open(os.path.join(ROOT, "nclient.js"), "r").read()
     return web.Response(content_type="application/javascript", text=content)
@@ -329,20 +394,6 @@ async def javascript(request):
     return web.Response(content_type="application/javascript", text=content)
 
 
-
-async def App(request):
-    content = open(os.path.join(ROOT, "src/App.js"), "r").read()
-    return web.Response(content_type="application/javascript", text=content)
-
-async def Route(request):
-    content = open(os.path.join(ROOT, "src/components/RouteList.js"), "r").read()
-    return web.Response(content_type="application/javascript", text=content)
-
-async def indexJS(request):
-    content = open(os.path.join(ROOT, "src/index.js"), "r").read()
-    return web.Response(content_type="application/javascript", text=content)
-
-'''
 async def receive(request):
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
@@ -454,9 +505,6 @@ async def offer(request):
             "type": pc.localDescription.type
             }
         ),
-        headers={
-            "X-Custom-Server-Header": "Custom data",    
-        }
     )
 
 
@@ -490,37 +538,13 @@ if __name__ == "__main__":
         ssl_context.load_cert_chain(args.cert_file, args.key_file)
     else:
         ssl_context = None
-    
-    @asyncio.coroutine
-    def handler(request):
-        return web.Response(
-            text="Hello!",
-            headers={
-                "X-Custom-Server-Header": "Custom data",
-            })
 
     app = web.Application()
-    # `aiohttp_cors.setup` returns `aiohttp_cors.CorsConfig` instance.
-    # The `cors` instance will store CORS configuration for the
-    # application.
-    cors = aiohttp_cors.setup(app, defaults={
-    "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=True,
-            expose_headers="*",
-            allow_headers="*",
-        )
-    })
-    
     app.on_shutdown.append(on_shutdown)
-    app.router.add_get("/", home)
-    #app.router.add_get("/preview", preview)
-    app.router.add_get("/track", track)
-    #app.router.add_get("/client.js", javascript)
-    #app.router.add_get("/nclient.js", javascriptn)
-    
-    #app.router.add_post("/offer", offer)
-    # Add all resources to `CorsConfig`.
-    resource = cors.add(app.router.add_resource("/offer"))
-    cors.add(resource.add_route("POST", offer))
+    app.router.add_get("/", index)
+    app.router.add_get("/preview", preview)
+    app.router.add_get("/client.js", javascript)
+    app.router.add_get("/nclient.js", javascriptn)
+    app.router.add_post("/offer", offer)
     app.router.add_post("/receive", receive)
     web.run_app(app, access_log=None, port=args.port, ssl_context=ssl_context)
